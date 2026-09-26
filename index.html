@@ -1,0 +1,446 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title></title>
+<style>
+  html, body { margin: 0; height: 100%; background: #000; overflow: hidden; }
+  canvas {
+    position: fixed; inset: 0;
+    width: 100%; height: 100%;
+    display: block;
+    cursor: grab;
+    touch-action: none;
+    background: #000;
+  }
+  canvas.drag { cursor: grabbing; }
+</style>
+</head>
+<body>
+<canvas id="c"></canvas>
+
+<script>
+(() => {
+const canvas = document.getElementById('c');
+const gl = canvas.getContext('webgl2', {
+  antialias: false, alpha: false, depth: false, stencil: false,
+  powerPreference: 'high-performance', preserveDrawingBuffer: false
+});
+if (!gl) { console.error('WebGL2 not available'); return; }
+
+const VS = `#version 300 es
+in vec2 a;
+void main(){ gl_Position = vec4(a, 0.0, 1.0); }`;
+
+const FS = `#version 300 es
+precision highp float;
+out vec4 o;
+
+uniform vec2  uRes;
+uniform float uTime;
+uniform vec2  uRot;      // yaw, pitch
+uniform float uDist;
+uniform float uPower;
+uniform vec3  uJulia;
+uniform float uJuliaMix;
+uniform float uWarp;
+uniform float uTwist;
+uniform float uPulse;
+uniform float uDrip;
+
+#define MAX_STEPS 140
+#define ITER 8
+#define BOUND 2.8
+const vec3 CEN = vec3(0., -.35, 0.);
+
+mat2 rot(float a){ float c = cos(a), s = sin(a); return mat2(c, -s, s, c); }
+
+vec3 pal(float t, vec3 a, vec3 b, vec3 c, vec3 d){ return a + b * cos(6.28318 * (c * t + d)); }
+vec3 palHot(float t){ return pal(t, vec3(.55,.25,.30), vec3(.45,.30,.35), vec3(1.,.8,.6), vec3(0.,.15,.55)); }
+vec3 palAcid(float t){ return pal(t, vec3(.5), vec3(.5), vec3(2.,1.,0.), vec3(.5,.2,.25)); }
+vec3 palIrid(float t){ return pal(t, vec3(.5), vec3(.5), vec3(1.), vec3(0.,.33,.67)); }
+
+float smin(float a, float b, float k){
+  float h = clamp(.5 + .5 * (b - a) / k, 0., 1.);
+  return mix(b, a, h) - k * h * (1. - h);
+}
+float sminH(float a, float b, float k, out float h){
+  h = clamp(.5 + .5 * (b - a) / k, 0., 1.);
+  return mix(b, a, h) - k * h * (1. - h);
+}
+float smax(float a, float b, float k){ return -smin(-a, -b, k); }
+
+// liquid domain warp, deliberately lopsided
+vec3 warp(vec3 p){
+  float t = uTime * .35;
+  vec3 q = p;
+  q += .22 * sin(q.zxy * 1.3 + vec3(t * .8, t * .6, t * 1.1));
+  q.xz *= rot(uTwist * q.y + .3 * sin(t * .7));
+  q.xy *= rot(.25 * uTwist * q.z);
+  q += uWarp * .11 * sin(q.yzx * 3.1 + vec3(t, t * 1.3, t * .7));
+  q += uWarp * .045 * sin(q.zxy * 7.3 - vec3(t * 1.7, t * .9, t * 2.1));
+  q.x += .09 * sin(q.y * 2.3 + t) + .05 * cos(q.z * 4.1 - t * 1.4);
+  return q;
+}
+
+// sags the underside and pulls scattered columns down into hanging drips
+vec3 stretch(vec3 p){
+  float t = uTime;
+  float a = sin(p.x * 3.7 + t * .4 + 1.5 * sin(p.z * 2.9 - t * .3));
+  float b = sin(p.z * 3.1 - t * .23 + .8 * p.x);
+  float s = pow(clamp(.5 + .5 * a * b, 0., 1.), 2.5) * uDrip;
+  float below = smoothstep(.1, -1., p.y);
+  p.y *= 1. - min(.15 + .55 * s, .72) * below;
+  return p;
+}
+
+// moving voids that break the body apart
+float holes(vec3 p){
+  float t = uTime * .2;
+  vec3 q = p * 1.6 + vec3(t, -t * .7, t * .4);
+  float n = sin(q.x) * cos(q.y * 1.3) + sin(q.y) * cos(q.z * 1.1) + sin(q.z * .9) * cos(q.x);
+  n += .5 * sin(q.x * 2.3 + q.z * 1.9 - t * 2.);
+  return n;
+}
+
+// hybrid mandelbulb / julia bulb with orbit trap
+float bulb(vec3 p, out vec4 trap){
+  vec3 w = p;
+  vec3 c = mix(p, uJulia, uJuliaMix);
+  float m = dot(w, w);
+  vec4 tr = vec4(abs(w), m);
+  float dz = 1.;
+  float pw = uPower;
+  float ph0 = .6 * sin(uTime * .21);
+  float ph1 = .4 * cos(uTime * .17);
+  for (int i = 0; i < ITER; i++){
+    float r = max(sqrt(m), 1e-6);
+    dz = pw * pow(r, pw - 1.) * dz + (1. - uJuliaMix);
+    float th = acos(clamp(w.y / r, -1., 1.)) * pw + ph0;
+    float ph = atan(w.x, w.z) * pw + ph1 + float(i) * .07 * uTwist;
+    w = c + pow(r, pw) * vec3(sin(th) * sin(ph), cos(th), sin(th) * cos(ph));
+    tr = min(tr, vec4(abs(w), m));
+    m = dot(w, w);
+    if (m > 64.) break;
+  }
+  trap = tr;
+  return .25 * log(m) * sqrt(m) / dz;
+}
+
+// floating droplets plus drops that neck off the body and fall
+float liquid(vec3 p){
+  float t = uTime;
+  float d = 1e9;
+  for (int i = 0; i < 3; i++){
+    float fi = float(i);
+    vec3 c = vec3(
+      sin(t * .27 * (fi + 1.) + fi * 2.1) * 1.5,
+      -.3 + cos(t * .21 * (fi + 1.3) + fi) * .9,
+      sin(t * .17 * (fi + .7) + fi * 4.) * 1.4
+    );
+    float r = .1 + .06 * sin(t * .5 + fi * 1.7);
+    vec3 q = p - c;
+    q += .04 * sin(q.yzx * 9. + t * 2.);
+    d = smin(d, length(q) - r, .25);
+  }
+  for (int i = 0; i < 8; i++){
+    float fi = float(i);
+    float h1 = fract(sin(fi * 12.9898 + 1.) * 43758.5453);
+    float h2 = fract(sin(fi * 78.233 + 2.) * 23421.631);
+    float h3 = fract(sin(fi * 39.425 + 3.) * 15731.743);
+    float cyc = fract(t * (.07 + .06 * h1) + h2);
+    float fall = cyc * cyc;
+    vec3 a = vec3((h1 - .5) * 1.5, -.2 - fall * 2.6, (h3 - .5) * 1.5);
+    a.xz += .05 * sin(t * .7 + fi);
+    float r = (.045 + .05 * h3) * smoothstep(1., .8, cyc);
+    float tail = r * (1.5 + 10. * fall);
+    vec3 ba = vec3(0., tail, 0.);
+    vec3 pa = p - a;
+    float hh = clamp(dot(pa, ba) / (dot(ba, ba) + 1e-5), 0., 1.);
+    float dd = length(pa - ba * hh) - r * mix(1., .25, hh);
+    d = smin(d, dd, .12);
+  }
+  return d;
+}
+
+float map(vec3 p, out vec4 trap, out float mat){
+  vec3 q = warp(stretch(p));
+  q = q * vec3(.78, 1.05, .9) + vec3(.12, .05, -.08);
+  float db = bulb(q, trap);
+  db = smax(db, (holes(p) - 1.15) * .14, .1);
+  float dl = liquid(p);
+  float h;
+  float d = sminH(dl, db, .3, h);
+  mat = h; // 1 = liquid, 0 = fractal body
+  d += uPulse * .025 * sin(length(p - CEN) * 18. - uTime * 9.);
+  return d * .55;
+}
+
+float mapD(vec3 p){ vec4 t; float m; return map(p, t, m); }
+
+vec3 calcN(vec3 p, float t){
+  vec2 e = vec2(1., -1.) * .0006 * max(t, 1.);
+  return normalize(
+    e.xyy * mapD(p + e.xyy) +
+    e.yyx * mapD(p + e.yyx) +
+    e.yxy * mapD(p + e.yxy) +
+    e.xxx * mapD(p + e.xxx));
+}
+
+float calcAO(vec3 p, vec3 n){
+  float occ = 0., sca = 1.;
+  for (int i = 0; i < 4; i++){
+    float h = .02 + .08 * float(i);
+    occ += (h - mapD(p + n * h)) * sca;
+    sca *= .7;
+  }
+  return clamp(1. - 2.2 * occ, 0., 1.);
+}
+
+// fake environment for chrome reflections
+vec3 env(vec3 d){
+  float a = atan(d.x, d.z) * .159;
+  vec3 c = palIrid(d.y * .5 + a + uTime * .02);
+  float band = pow(max(0., sin(d.y * 6. + a * 18.85 + uTime * .3)), 10.);
+  float band2 = pow(max(0., sin(d.x * 4. - d.z * 3. - uTime * .2)), 16.);
+  return c * (.06 + 1.4 * band + .8 * band2);
+}
+
+float hash(vec2 p){ return fract(sin(dot(p, vec2(127.1, 311.7))) * 43758.5453); }
+
+void main(){
+  vec2 uv = (gl_FragCoord.xy * 2. - uRes) / uRes.y;
+
+  float cp = cos(uRot.y), sp = sin(uRot.y);
+  vec3 ro = CEN + uDist * vec3(cp * sin(uRot.x), sp, cp * cos(uRot.x));
+  vec3 ww = normalize(CEN - ro);
+  vec3 uu = normalize(cross(ww, vec3(0., 1., 0.)));
+  vec3 vv = cross(uu, ww);
+  vec3 rd = normalize(uv.x * uu + uv.y * vv + 1.8 * ww);
+
+  vec3 col = vec3(0.);
+  float t = -1.;
+
+  vec3 oc = ro - CEN;
+  float b = dot(oc, rd);
+  float cc = dot(oc, oc) - BOUND * BOUND;
+  float disc = b * b - cc;
+  if (disc > 0.){
+    disc = sqrt(disc);
+    float tt = max(-b - disc, 0.);
+    float tmax = -b + disc;
+    vec4 tr; float mt;
+    for (int i = 0; i < MAX_STEPS; i++){
+      vec3 p = ro + rd * tt;
+      float d = map(p, tr, mt);
+      if (d < .0007 * tt){ t = tt; break; }
+      tt += d;
+      if (tt > tmax) break;
+    }
+  }
+
+  if (t > 0.){
+    vec3 p = ro + rd * t;
+    vec3 n = calcN(p, t);
+    vec4 tr; float mt;
+    map(p, tr, mt);
+    vec3 q = warp(p);
+
+    float ndv = max(dot(n, -rd), 0.);
+    float fres = pow(1. - ndv, 3.);
+
+    // per region coloring: hot body, acid zones, iridescent liquid
+    vec3 hot  = palHot(sqrt(tr.w) * 1.2 + tr.y * .6 + uTime * .01);
+    vec3 acid = palAcid(tr.x * 1.5 + tr.z * .8 - uTime * .015);
+    float zone = smoothstep(-.35, .35,
+      sin(q.x * 2.1 + q.y * 1.3 - q.z * 1.7 + uTime * .15) + .6 * sin(q.z * 3.3 + q.x - uTime * .07));
+    vec3 body = mix(hot, acid, zone);
+
+    vec3 irid = palIrid(ndv * 1.4 + dot(n, vec3(.3, .5, .2)) + p.y * .4 + uTime * .05);
+    vec3 drop = irid * .7 + .15;
+
+    vec3 base = mix(body, drop, mt);
+    base = mix(base, irid, .35 * fres + .2 * mt);
+
+    vec3 l1 = normalize(vec3(.6, .8, -.4));
+    vec3 l2 = normalize(vec3(-.7, -.2, .6));
+    float dif  = max(dot(n, l1), 0.);
+    float dif2 = max(dot(n, l2), 0.);
+    float ao = calcAO(p, n);
+    vec3 r = reflect(rd, n);
+    float spec  = pow(max(dot(r, l1), 0.), 48.);
+    float spec2 = pow(max(dot(r, l2), 0.), 24.);
+
+    col  = base * (.1 + .9 * dif * vec3(1., .9, .8) + .5 * dif2 * vec3(.4, .5, 1.)) * ao;
+    col += env(r) * (.25 + .9 * fres) * mix(vec3(1.), base, .5) * ao;
+    col += (spec * vec3(1.) + spec2 * vec3(.6, .7, 1.)) * ao;
+    col += irid * fres * .35;
+  }
+
+  col = 1. - exp(-col * 1.35);
+  col = pow(col, vec3(.9));
+  col *= 1. - .25 * dot(uv * .5, uv * .5);
+  col += (hash(gl_FragCoord.xy + fract(uTime) * 91.) - .5) * .025;
+
+  o = vec4(max(col, 0.), 1.);
+}`;
+
+function compile(type, src){
+  const s = gl.createShader(type);
+  gl.shaderSource(s, src);
+  gl.compileShader(s);
+  if (!gl.getShaderParameter(s, gl.COMPILE_STATUS)) console.error(gl.getShaderInfoLog(s));
+  return s;
+}
+const prog = gl.createProgram();
+gl.attachShader(prog, compile(gl.VERTEX_SHADER, VS));
+gl.attachShader(prog, compile(gl.FRAGMENT_SHADER, FS));
+gl.linkProgram(prog);
+if (!gl.getProgramParameter(prog, gl.LINK_STATUS)) console.error(gl.getProgramInfoLog(prog));
+gl.useProgram(prog);
+
+const buf = gl.createBuffer();
+gl.bindBuffer(gl.ARRAY_BUFFER, buf);
+gl.bufferData(gl.ARRAY_BUFFER, new Float32Array([-1, -1, 3, -1, -1, 3]), gl.STATIC_DRAW);
+const aLoc = gl.getAttribLocation(prog, 'a');
+gl.enableVertexAttribArray(aLoc);
+gl.vertexAttribPointer(aLoc, 2, gl.FLOAT, false, 0, 0);
+
+const U = {};
+['uRes','uTime','uRot','uDist','uPower','uJulia','uJuliaMix','uWarp','uTwist','uPulse','uDrip']
+  .forEach(n => U[n] = gl.getUniformLocation(prog, n));
+
+// adaptive render scale
+const maxScale = Math.min(window.devicePixelRatio || 1, 1.5);
+let scale = Math.min(0.7, maxScale);
+function resize(){
+  const w = Math.max(1, Math.floor(innerWidth * scale));
+  const h = Math.max(1, Math.floor(innerHeight * scale));
+  if (canvas.width !== w || canvas.height !== h){
+    canvas.width = w; canvas.height = h;
+    gl.viewport(0, 0, w, h);
+  }
+}
+
+// interaction state
+const S = {
+  yaw: 0.6, pitch: 0.2, dist: 4.0,
+  vYaw: 0, vPitch: 0,
+  powerK: 0, twistK: 0, warpE: 0, pulse: 0,
+  mx: 0, my: 0,
+  jm: 0.3, j: [0.3, -0.2, 0.4]
+};
+const clamp = (v, a, b) => Math.min(b, Math.max(a, v));
+
+const pointers = new Map();
+let pinchD = 0;
+const pinchDist = () => {
+  const p = [...pointers.values()];
+  return Math.hypot(p[0].x - p[1].x, p[0].y - p[1].y);
+};
+
+canvas.addEventListener('pointerdown', e => {
+  canvas.setPointerCapture(e.pointerId);
+  pointers.set(e.pointerId, { x: e.clientX, y: e.clientY });
+  canvas.classList.add('drag');
+  S.pulse = 1;
+  S.warpE += 0.4;
+  if (pointers.size === 2) pinchD = pinchDist();
+});
+
+canvas.addEventListener('pointermove', e => {
+  S.mx = e.clientX / innerWidth * 2 - 1;
+  S.my = 1 - e.clientY / innerHeight * 2;
+  const p = pointers.get(e.pointerId);
+  if (!p) return;
+  const dx = e.clientX - p.x, dy = e.clientY - p.y;
+  p.x = e.clientX; p.y = e.clientY;
+
+  if (pointers.size === 2){
+    const d = pinchDist();
+    if (pinchD > 0) S.dist = clamp(S.dist * pinchD / d, 1.4, 7);
+    pinchD = d;
+    return;
+  }
+  // camera orbit
+  S.vYaw   -= dx * 0.0045;
+  S.vPitch += dy * 0.0045;
+  // shape manipulation
+  S.powerK += dx * 0.006;
+  S.twistK += dy * 0.004;
+  S.warpE  += Math.hypot(dx, dy) * 0.006;
+});
+
+const release = e => {
+  pointers.delete(e.pointerId);
+  if (pointers.size < 2) pinchD = 0;
+  if (pointers.size === 0) canvas.classList.remove('drag');
+};
+canvas.addEventListener('pointerup', release);
+canvas.addEventListener('pointercancel', release);
+
+canvas.addEventListener('wheel', e => {
+  e.preventDefault();
+  S.dist = clamp(S.dist * Math.exp(e.deltaY * 0.001), 1.4, 7);
+  S.warpE += 0.05;
+}, { passive: false });
+
+// loop
+const t0 = performance.now();
+let last = t0, acc = 0, frames = 0;
+
+function frame(now){
+  const dt = now - last; last = now;
+  if (dt < 200){ acc += dt; frames++; }
+  if (frames >= 30){
+    const avg = acc / frames;
+    if (avg > 24 && scale > 0.3) scale = Math.max(0.3, scale * 0.85);
+    else if (avg < 17.5 && scale < maxScale) scale = Math.min(maxScale, scale * 1.05);
+    acc = 0; frames = 0;
+  }
+  resize();
+
+  const t = (now - t0) / 1000;
+  const dragging = pointers.size > 0;
+
+  S.yaw += S.vYaw; S.pitch += S.vPitch;
+  S.vYaw *= 0.9; S.vPitch *= 0.9;
+  if (!dragging) S.yaw += 0.0012;
+  S.pitch = clamp(S.pitch, -1.4, 1.4);
+
+  S.powerK = clamp(S.powerK * 0.992, -4, 4);
+  S.twistK = clamp(S.twistK * 0.99, -1.5, 1.5);
+  S.warpE  = Math.min(S.warpE * 0.965, 3);
+  S.pulse *= 0.94;
+
+  const power = clamp(7 + 1.6 * Math.sin(t * 0.11) + 0.6 * Math.sin(t * 0.037) + S.powerK, 2.5, 12);
+  const jmTarget = dragging ? 0.75 : 0.3 + 0.2 * Math.sin(t * 0.07);
+  S.jm += (jmTarget - S.jm) * 0.02;
+  const jt = [
+    S.mx * 0.9 + 0.2 * Math.sin(t * 0.13),
+    S.my * 0.9,
+    0.6 * Math.sin(t * 0.09) + 0.3 * Math.cos(t * 0.21)
+  ];
+  for (let i = 0; i < 3; i++) S.j[i] += (jt[i] - S.j[i]) * 0.03;
+
+  gl.uniform2f(U.uRes, canvas.width, canvas.height);
+  gl.uniform1f(U.uTime, t);
+  gl.uniform2f(U.uRot, S.yaw, S.pitch);
+  gl.uniform1f(U.uDist, S.dist);
+  gl.uniform1f(U.uPower, power);
+  gl.uniform3f(U.uJulia, S.j[0], S.j[1], S.j[2]);
+  gl.uniform1f(U.uJuliaMix, S.jm);
+  gl.uniform1f(U.uWarp, 0.55 + 0.35 * Math.sin(t * 0.19) + S.warpE);
+  gl.uniform1f(U.uTwist, 0.35 * Math.sin(t * 0.08) + S.twistK);
+  gl.uniform1f(U.uPulse, S.pulse);
+  gl.uniform1f(U.uDrip, clamp(0.9 + 0.2 * Math.sin(t * 0.13) + S.warpE * 0.08, 0, 1.3));
+
+  gl.drawArrays(gl.TRIANGLES, 0, 3);
+  requestAnimationFrame(frame);
+}
+requestAnimationFrame(frame);
+})();
+</script>
+</body>
+</html>
